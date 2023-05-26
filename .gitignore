@@ -1,2 +1,4 @@
 /.idea/
 /venv/
+cbioportal-clickhouse-generic-assay-util.iml
+db_conn_info.py

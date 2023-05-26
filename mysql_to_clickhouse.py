@@ -1,105 +1,92 @@
 import mysql.connector
 import clickhouse_connect
+import db_conn_info
 
 # connection information
 mysql_connection = mysql.connector.connect(
-    host='host',
-    user='username',
-    password='password',
-    database='database',
+    host=db_conn_info.mysql_host,
+    user=db_conn_info.mysql_user,
+    password=db_conn_info.mysql_password,
+    database=db_conn_info.mysql_database,
 )
 mysql_cursor = mysql_connection.cursor()
 
 clickhouse_client = clickhouse_connect.get_client(
-    host='localhost',
+    host=db_conn_info.clickhouse_host,
     port=8123,
-    user='username',
-    password='password',
-    database='database',
+    user=db_conn_info.clickhouse_user,
+    password=db_conn_info.clickhouse_password,
+    database=db_conn_info.clickhouse_database,
 )
 
 # queries
-query_genetic_alteration_total_rows = '''
-    SELECT COUNT(*) 
-    FROM genetic_alteration
+query_samples_profile_entity_study_values = '''
+SELECT gps.ORDERED_SAMPLE_LIST, gp.STABLE_ID, ge.STABLE_ID, cs.CANCER_STUDY_IDENTIFIER, `VALUES`
+FROM genetic_profile gp
+         JOIN cancer_study cs on gp.CANCER_STUDY_ID = cs.CANCER_STUDY_ID
+         JOIN genetic_alteration ga on gp.GENETIC_PROFILE_ID = ga.GENETIC_PROFILE_ID
+         JOIN genetic_entity ge on ga.GENETIC_ENTITY_ID = ge.ID
+         JOIN genetic_profile_samples gps on gp.GENETIC_PROFILE_ID = gps.GENETIC_PROFILE_ID
+WHERE cs.CANCER_STUDY_IDENTIFIER = %s AND gp.GENETIC_ALTERATION_TYPE = 'GENERIC_ASSAY'
 '''
 
-query_values_samples_profile_entity = '''
-    SELECT `VALUES`, ORDERED_SAMPLE_LIST, gp.STABLE_ID, ge.STABLE_ID
-    FROM genetic_alteration ga
-    JOIN genetic_profile_samples gps ON ga.GENETIC_PROFILE_ID = gps.GENETIC_PROFILE_ID
-    JOIN genetic_profile gp ON ga.GENETIC_PROFILE_ID = gp.GENETIC_PROFILE_ID
-    JOIN genetic_entity ge ON ga.GENETIC_ENTITY_ID = ge.ID
-    WHERE gp.GENETIC_ALTERATION_TYPE = 'GENERIC_ASSAY'
-    LIMIT %s OFFSET %s
+query_sample_patient = '''
+SELECT s.STABLE_ID, p.INTERNAL_ID, p.STABLE_ID
+FROM sample s
+        JOIN patient p on s.PATIENT_ID = p.INTERNAL_ID
+WHERE s.INTERNAL_ID = %s
 '''
 
-query_sample_patient_cancer_study = '''
-    SELECT s.STABLE_ID, p.INTERNAL_ID, p.STABLE_ID, cs.CANCER_STUDY_IDENTIFIER
-    FROM sample s
-    JOIN patient p ON s.PATIENT_ID = p.INTERNAL_ID
-    JOIN cancer_study cs on p.CANCER_STUDY_ID = cs.CANCER_STUDY_ID
-    WHERE s.INTERNAL_ID = %(value)s
-'''
+# given a study, fetch all samples, genetic profile / entity stable id and values
+print('Fetching study data...')
+study = 'brca_tcga_pan_can_atlas_2018'
+mysql_cursor.execute(query_samples_profile_entity_study_values, (study,))
+samples_profile_entity_study_values = mysql_cursor.fetchall()
 
-# get total number of rows
-mysql_cursor.execute(query_genetic_alteration_total_rows)
-total_rows = mysql_cursor.fetchone()[0]
+# extract all sample ids
+print('Extracting sample ids...')
+sample_id_set = set()
+for row in samples_profile_entity_study_values:
+    ordered_sample_list = row[0]
+    sample_array = ordered_sample_list.split(',')
+    if sample_array and sample_array[-1] == '':
+        sample_array.pop()
+    sample_id_set.update(sample_array)
 
-# transform all data and insert
-batch_size = 10000
-start_row = 0
-while start_row < total_rows:
-    print('Working on', start_row, 'out of', total_rows, 'rows')
+# given set of sample ids, fetch all patient data
+print('Fetching patient data...')
+sample_id_to_patient = {}
+for sample_id in sample_id_set:
+    mysql_cursor.execute(query_sample_patient, (int(sample_id),))
+    sample_id_to_patient[sample_id] = mysql_cursor.fetchone()
 
-    # fetch values, samples, profile and entity stable id
-    mysql_cursor.execute(query_values_samples_profile_entity, (batch_size, start_row))
-    profile_entity_values_samples = mysql_cursor.fetchall()
+# denormalize
+print('Denormalizing...')
+denormalized_data = []
+for row in samples_profile_entity_study_values:
+    ordered_sample_list, genetic_profile_stable_id, genetic_entity_stable_id, cancer_study_identifier, values = row
 
-    # split data
-    transformed_data = []
-    sample_id_set = set()
-    for row in profile_entity_values_samples:
-        values, ordered_sample_list, genetic_profile_stable_id, genetic_entity_stable_id = row
+    sample_array = ordered_sample_list.split(',')
+    if sample_array and sample_array[-1] == '':
+        sample_array.pop()
 
-        value_array = values.split(',')
-        if value_array and value_array[-1] == '':
-            value_array.pop()
+    value_array = values.split(',')
+    if value_array and value_array[-1] == '':
+        value_array.pop()
 
-        sample_array = ordered_sample_list.split(',')
-        if sample_array and sample_array[-1] == '':
-            sample_array.pop()
-        sample_id_set.update(sample_array)
+    for i in range(len(sample_array)):
+        sample_unique_id = sample_array[i]
+        sample_stable_id, patient_unique_id, patient_stable_id = sample_id_to_patient.get(sample_unique_id)
+        new_row = [sample_unique_id, sample_stable_id, str(patient_unique_id), patient_stable_id, genetic_profile_stable_id, genetic_entity_stable_id, cancer_study_identifier, value_array[i]]
+        denormalized_data.append(new_row)
 
-        if len(value_array) == len(sample_array):
-            for i in range(len(value_array)):
-                new_row_1 = [sample_array[i], genetic_profile_stable_id, genetic_entity_stable_id, value_array[i]]
-                transformed_data.append(new_row_1)
-
-    # fetch other columns from extracted sample ids
-    sample_id_to_sample_patient_cancer_study = {}
-    for sample_id in sample_id_set:
-        params = {'value': sample_id}
-        mysql_cursor.execute(query_sample_patient_cancer_study, params)
-        sample_patient_cancer_study = mysql_cursor.fetchone()
-
-        sample_stable_id, patient_unique_id, patient_stable_id, cancer_study_identifier = sample_patient_cancer_study
-
-        new_row_2 = [sample_stable_id, str(patient_unique_id), patient_stable_id, cancer_study_identifier]
-        sample_id_to_sample_patient_cancer_study[sample_id] = new_row_2
-
-    # reorganize data together
-    for row_1 in transformed_data:
-        row_2 = sample_id_to_sample_patient_cancer_study.get(row_1[0])
-        row_1[1:1] = row_2[:3]
-        row_1[-1:-1] = [row_2[3]]
-
-    # insert this batch into ClickHouse
-    clickhouse_client.insert('mysql_genetic_alteration', transformed_data)
-    start_row += batch_size
+# insert
+print('Inserting...')
+target_table = 'mysql_genetic_alteration'
+clickhouse_client.insert(target_table, denormalized_data)
 
 # close
-print('Transform completed. Closing...')
+print('Done!')
 mysql_cursor.close()
 mysql_connection.close()
 clickhouse_client.close()
